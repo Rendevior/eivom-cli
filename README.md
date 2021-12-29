@@ -1,5 +1,7 @@
 # eivom-cli
 Simple Script that can watch movies via Command Line
+
+This tool Scrapes "https://series9.me" (As Temporary Source)
 # Installation
 ```
 git clone https://github.com/TheGlockMisc/eivom-cli.git
