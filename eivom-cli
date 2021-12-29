@@ -1,0 +1,618 @@
+#!/bin/bash
+
+# Dependencies: Awk, Grep, Curl, CoreUtils, Sed, Aria2
+
+# URL Sources
+BASE_URL="https://series9.me"
+BASE_API_URL="https://api.ocloud.stream"
+VidPlayer="mpv"
+
+# Regexes
+REGNUMBERONLY="^([M|m]ovie|[0-9][0-9]*)+$"
+NOPUNCTUATIONS='['!'@#\$%^\&*()_+€£¥₩÷×~`¡¿<>%+{}]'
+HHSS="^[1-2]$"
+REGMOVIEPICKED="^([0-9]*)+$|^([0-9]*).[0-9]"
+QualityPicker="high"
+
+function InstallPrerequisites(){
+	# Config Files
+	if [ -f /etc/eivom/eivomvars ]; then
+		source /etc/eivom/eivomvars
+	else
+		if [[ $EUID -ne 0 ]]; then
+			ErrorFunc 'Must have Sudo Permission to Write Files'
+			InfoFunc "Run: sudo $(basename "$0")"
+			exit 7
+		fi
+		mkdir /etc/eivom
+		curl -sL "https://raw.githubusercontent.com/TheGlockMisc/eivom-cli/master/files/eivomvars" -o /etc/eivom/eivomvars
+		source /etc/eivom/eivomvars
+	fi
+	if ! [ -f "/usr/local/sbin/$(basename "$0")" ]; then
+		if [[ $EUID -ne 0 ]]; then
+			ErrorFunc 'Must have Sudo Permission to Write Files'
+			InfoFunc "Run: sudo $(basename "$0")"
+			exit 7
+		fi
+		MainDire="$(dirname "$(readlink -f "$0")")/$(basename "$0")"
+		cp "$MainDire" "/usr/local/sbin/$(basename "$0")"
+		chmod +x "/usr/local/sbin/$(basename "$0")"
+		rm "$MainDire"
+		InfoFunc "The File was Moved!! You Can Execute it in any Directory"
+		InfoFunc "Run: $(basename "$0")"
+		exit 0
+	fi
+}
+
+function AutoInstallerDependenciesapt(){
+	if [[ -f "/var/lib/apt/periodic/update-success-stamp" ]]; then
+		LAST_UPDATED="$( stat --format="%X" /var/lib/apt/periodic/update-success-stamp )"
+		UNIX_TIME="$( date +%s )"
+		TIME_DIFF="$(( UNIX_TIME - LAST_UPDATED ))"
+		if [[ "${TIME_DIFF}" -gt 2629746 ]]; then
+			sudo apt-get update -y
+			sudo apt-get upgrade y
+		fi
+	else
+		sudo apt-get update -y
+		sudo apt-get upgrade y
+	fi
+	for packages in curl sed grep awk; do
+		if ! [ -x "$(command -v $packages)" ]; then
+			sudo apt install $packages -y
+			clear
+		fi
+	done
+	if ! [ -x "$(command -v aria2c)" ]; then
+		sudo apt install aria2 -y
+		clear
+	fi
+}
+
+function isDependenciesInstalled(){
+	for checks in curl aria2c sed grep awk bc tput; do
+		if ! [ -x "$(command -v $checks)" ]; then
+			echo "Package $checks is not installed, Please install it before running this script" >&2
+			exit 1
+		fi
+	done
+}
+
+function InputsGet(){
+	MainMenuMessage
+	if [[ $MovieName == "" ]]; then
+		read -rp "$(InputSign "Movie Name: ")" MovieName
+	fi
+	while true; do
+		if [[ $MovieName =~ $NOPUNCTUATIONS ]]; then
+			ErrorFunc "Movie Name Mustn't have Punctuations Marks"
+			unset MovieName
+			read -rp "$(InputSign "Movie Name: ")" MovieName
+		elif [[ $MovieName = "" ]]; then
+			ErrorFunc "You Entered Nothing"
+			unset MovieName
+			read -rp "$(InputSign "Movie Name: ")" MovieName
+		else
+			break
+		fi
+	done
+	GetMovieName
+	ChoicesDisplayMovie
+	if [[ $MoviePicked == "" ]]; then
+		read -rp "$(InputSign "Pick a Number: ")" MoviePicked
+	fi
+	while true; do
+		if ! [[ $MoviePicked =~ $REGMOVIEPICKED ]]; then
+			ErrorFunc "Numbers Only Allowed"
+			unset MoviePicked
+			read -rp "$(InputSign "Pick a Number: ")" MoviePicked
+		elif [[ $MoviePicked = "" ]]; then
+			ErrorFunc "You Entered Nothing"
+			unset MoviePicked
+			read -rp "$(InputSign "Pick a Number: ")" MoviePicked
+		else
+			break
+		fi
+	done
+	GetMovieLink
+	if [[ $EpsCelc == "" ]]; then
+		read -rp "$(InputSign "Episode [Default: movie]: ")" EpsCelc
+	fi
+	if [[ $EpsCelc = "" ]]; then
+		EpsCelc="movie"
+	fi
+	while true; do
+		if [[ $EpsCelc =~ $NOPUNCTUATIONS ]]; then
+			ErrorFunc "Movie Name Mustn't have Punctuations Marks"
+			unset EpsCelc
+			read -rp "$(InputSign "Episode [Default: movie]: ")" EpsCelc
+		elif ! [[ $EpsCelc =~ $REGNUMBERONLY ]]; then
+			ErrorFunc "Numbers Only Allowed"
+			unset EpsCelc
+			read -rp "$(InputSign "Episode [Default: movie]: ")" EpsCelc
+		elif [[ $EpsCelc = "" ]]; then
+			EpsCelc="movie"
+		else
+			break
+		fi
+	done
+	if [[ "$EpsCelc" =~ [M|m]ovie ]]; then
+		LinkMoviePicked="$LinkMoviePickedBR1/watching.html?ep=1"
+		ValidMovie="1"
+	else
+		LinkMoviePicked="$LinkMoviePickedBR1/watching.html?ep=$EpsCelc"
+		ValidMovie="0"
+	fi
+	if [[ $server = "" ]]; then
+		server="1"
+	fi
+	InfoFunc "Please Wait... I'm doing my job!"
+}
+
+function GetMovieName(){
+	MovieNameReplace=$(
+		echo "$MovieName" | \
+		tr ' ' '-'
+	)
+	LoadPageIndex=$(
+		curl -s -X GET -e "$BASE_URL" "$BASE_API_URL/series/movie/search/$MovieNameReplace?link_web=$BASE_URL/"
+	)
+	CheckMovieAvailable=$(
+		echo "$LoadPageIndex" | \
+		sed -n '/<div class="ml-item">/,/<\/div>/p;s/^[[:space:]]*//g' | \
+		grep -o '<h2>.*</h2>' | \
+		sed 's|<[/|a-zA-Z0-9]*>||g'
+	)
+	if [[ $CheckMovieAvailable = "" ]]; then
+		ErrorFunc "The Movie you Entered was not Found in Database"
+		sleep 2
+		unset MovieName MoviePicked EpsCelc
+		InputsGet
+	fi
+}
+
+function ChoicesDisplayMovie(){
+	echo "$LoadPageIndex" | \
+	sed -n '/<div class="ml-item">/,/<\/div>/p;s/^[[:space:]]*//g' | \
+	grep -o '<h2>.*</h2>' | \
+	sed 's|<[/|a-zA-Z0-9]*>||g' | \
+	while read -r wiffles; do
+		if [[ ${#wiffles} -gt 47 ]]; then
+			echo "${wiffles:0:47}..${wiffles:(${#wiffles}-10):${#wiffles}}"
+		else 
+			echo "${wiffles}"
+		fi
+	done | \
+	nl -w1 -s"+ " | \
+	printTable '+' "Num+Movie Name\n$(awk '{print $0}')"
+}
+
+function GetMovieLink(){
+	LinkMoviePickedBR1=$(
+		echo "$LoadPageIndex" | \
+		grep -o "https://[^'\"<>]*" | \
+		grep "//film" | \
+		sed 's|//film|/film|g' | \
+		sed -n "$MoviePicked"p
+	)
+}
+
+# SBPlay
+# ScrapeBR1
+function ServerNum1(){
+	ScrapeBR1=$(
+		curl -sL "$LinkMoviePicked" | \
+		sed -n '/<div class="mobile-btn">/,/<\/div>/p' | \
+		sed 's/^[[:space:]]*//g' | \
+		grep -o "//[^'\"<>]*" | \
+		sed 's|^|https:|g'
+	)
+	Server2=$(
+		curl -sL "$ScrapeBR1" | \
+		grep 'sbplay' | \
+		grep -o "https://[^'\"<>]*" | \
+		awk 'NR==1'
+	)
+	for QulitySB in 1920 1280 1080 900 852 808 720 640 480 360; do
+		VaLMain=$(
+			curl -sL "$Server2" | \
+			grep -o '<tr><td><a.*href="#".*onclick="download.*>.*</td>' | \
+			grep "$QulitySB" | \
+			awk -F["'"] '{print $2" "$4" "$6}'
+		)
+		if [[ -n $VaLMain ]]; then
+			break
+		fi
+	done
+	IDLnk=$(
+		echo "$VaLMain" | \
+		xargs | \
+		awk '{print $1}'
+	)
+	MODELnk=$(
+		echo "$VaLMain" | \
+		xargs | \
+		awk '{print $2}'
+	)
+	HASHSolver=$(
+		echo "$VaLMain" | \
+		xargs | \
+		awk '{print $3}'
+	)
+	MainDownDirectBR1="https://sbplay1.com/dl?op=download_orig&id=${IDLnk}&mode=${MODELnk}&hash=${HASHSolver}"
+	MainDownDirect=$(
+		curl -sL "$MainDownDirectBR1" | \
+		grep 'Direct Download' | \
+		grep -o "https:[^'\"<>]*"
+	)
+	ConGrep=$(
+		curl -LsI "$MainDownDirect" | \
+		grep '[C|c]ontent-[L|l]ength' | \
+		awk '{print $2}'
+	)
+	ConGrep=$(
+		echo "$ConGrep" | \
+		tr -dc '[:print:]'
+	)
+	if [[ -z "$ConGrep" ]]; then
+		ConGrep="1"
+	fi
+	if [[ $ConGrep -lt 225000 ]]; then
+		ErrorFunc "This Movie haven't uploaded our Database yet or the Movie is Not Released, Try it again if it have dice"
+		sleep 2
+		exit 0
+	fi
+}
+
+# Fembed (Buggy Server)
+function ServerNum2(){
+	ScrapeBR1=$(
+		curl -sL "$LinkMoviePicked" | \
+		sed -n '/<div class="mobile-btn">/,/<\/div>/p' | \
+		sed 's/^[[:space:]]*//g' | \
+		grep -o "//[^'\"<>]*" | \
+		sed 's|^|https:|g'
+	)
+	URLServer1Load=$(
+		curl -sL "$ScrapeBR1" | \
+		grep -e 'embedsito' -e 'fembed' | \
+		grep -o "https://[^'\"<>]*" | \
+		sed -n 1p
+	)
+	if [[ -z "$URLServer1Load" ]]; then
+		ErrorFunc "Server Not found"
+		exit 1
+	fi
+	RootUrlE=$(
+		echo "$URLServer1Load" | \
+		awk -F[/] '{print $3}'
+	)
+	Server1=$(
+		echo "$URLServer1Load" | \
+		awk 'NR==1'
+	)
+	DMCACHECK1=$(
+		curl -sL "$Server1" | \
+		grep -o 'DMCA'
+	)
+	if [[ -n "$DMCACHECK1" ]]; then
+		ErrorFunc "Server Has been Deleted due to DMCA Copyrights, You can Switch Servers"
+		exit 1
+	fi
+	GetAPIServ1=$(
+		curl -sL "$Server1" | \
+		grep '$.post' | \
+		awk -F["'"] '{print $2}' | \
+		sed "s|/api|https://$RootUrlE/api|g"
+	)
+	DirectDownLinksList=$(
+		curl -s -X POST -e "https://$RootUrlE" "$GetAPIServ1" | \
+		grep -o "https:[^'\"<>]*" | \
+		grep 'fvs' | \
+		sed 's/[\]//g' | \
+		tac | \
+		xargs
+	)
+	for LISTER in $DirectDownLinksList; do
+		ConGrep=$(
+			curl -e "$RootUrlE" -LsI "$LISTER" | \
+			grep '[C|c]ontent-[L|l]ength' | \
+			awk '{print $2}' | \
+			tr -dc '[:print:]'
+		)
+		if [[ -z "$ConGrep" ]]; then
+			ConGrep="1"
+		fi
+		if [[ "$ConGrep" -gt "225000" ]]; then
+			MainDownDirect="$LISTER"
+			break
+		else
+			ErrorCatchFunc "Kek.. Server Down, so Im gonna do my Job to find another server"
+		fi
+	done
+	if [[ -z "$MainDownDirect" ]]; then
+		ErrorFunc "Server Failed to Fetch"
+		exit
+	fi
+}
+
+function ScraperStateion(){
+	if [[ $server = "1" ]]; then
+		ServerNum1
+	elif [[ $server = "2" ]]; then
+		ServerNum2
+	fi
+}
+
+function DownloadMovieEngine(){
+	MovieFName=$(
+		echo "$CheckMovieAvailable" | \
+		sed "s|[():+><'#\&$%{}\!]||g;s|[[:space:]]|-|g;s|--||g;s|-$||g" | \
+		sed -n "$MoviePicked"p
+	)
+	if [[ "$ValidMovie" == "1" ]]; then
+		MovieFNameEXT="$MovieFName-MOVIE.mp4"
+	elif [[ "$ValidMovie" == "0" ]]; then
+		MovieFNameEXT="$MovieFName-EPI$EpsCelc.mp4"
+	fi
+	MainMenuMessage
+	echo
+	TimeStart=$(date +%s)
+	InfoFunc "Video Size: $(UnitConversion "$ConGrep")"
+	aria2c -s 16 -x 16 --download-result=hide --console-log-level=error --auto-save-interval=0 "$MainDownDirect" -o "$MovieFNameEXT" 2>/dev/null
+	TimeElapse=$(date +%s)
+	echo
+	InfoFunc "Downloading Completed!! Thanks for Using!!"
+	AdditionalInfoFunc "Took $(TimeTranslate $(( TimeElapse - TimeStart ))) to Finish"
+	exit 0
+}
+
+function StreamServ1(){
+	ServerNum1 "$ScrapeBR1"
+	if [[ $MainDownDirect == "" ]]; then
+		ErrorFunc "Server Failed to Fetch"
+		exit 1
+	fi
+	StreamMainLink="$MainDownDirect"
+}
+
+function StreamServ2(){
+	ServerNum2 "$ScrapeBR1"
+	if [[ $MainDownDirect == "" ]]; then
+		ErrorFunc "Server Failed to Fetch"
+		exit 1
+	fi
+	StreamMainLink="$MainDownDirect"
+}
+
+function WatchGetData(){
+	if [[ ! $QualityPicker =~ ^([H|h]igh|[L|l]ow*)$ ]]; then
+		ErrorFunc "Undefined Option, Bruh just pick between (High, Low) Server"
+		sleep 2
+		unset QualityPicker
+		OverAllInputs
+	fi
+	if [[ "$server" =~ $HHSS ]];then
+		if [[ $server == "1" ]]; then
+			StreamServ1
+		elif [[ $server == "2" ]]; then
+			StreamServ2
+		else
+			ErrorFunc "Watch Mode only Available in Server 1 and 2"
+			exit 1
+		fi
+	else
+		ErrorFunc "Invalid Server Value..."
+		exit 1
+	fi
+	if [[ $VidPlayer == "mpv" ]]; then
+		setsid -f mpv "$StreamMainLink" >/dev/null 2>&1
+	elif [[ $VidPlayer == "vlc" ]]; then
+		setsid -f vlc.exe "$StreamMainLink" >/dev/null 2>&1
+	else
+		ErrorFunc "Invalid Player" >&2
+		exit 1
+	fi
+}
+
+function WatchAnime(){
+	while true; do
+		WatchGetData
+		clear
+		MainMenuMessage
+		MoviePlaying=$(
+			echo "$CheckMovieAvailable" | \
+			sed -n "$MoviePicked"p | \
+			while read -r wiffles; do
+				if [[ ${#wiffles} -gt 47 ]]; then
+					echo "${wiffles:0:47}..${wiffles:(${#wiffles}-10):${#wiffles}}"
+				else 
+					echo "${wiffles}"
+				fi
+			done
+		)
+		echoterd "Now Playing: $MoviePlaying"
+		NumberingFunc "1" "Search For Another Movie"
+		NumberingFunc "2" "Exit the Program"
+		read -rp "$(InputSign 'Pick a Number: ')" PickedSelected
+		while [[ $PickedSelected -gt 2 ]]; do
+			ErrorFunc "Undefined Number Pick"
+			read -rp "$(InputSign 'Pick a Number: ')" PickedSelected
+		done
+		case $PickedSelected in
+			1)
+				unset MovieName MoviePicked EpsCelc
+				MainFunctions
+				;;
+			2)
+				exit 0
+				;;
+			esac
+	done
+}
+
+function ParseArgs(){
+	while getopts ":DdvVhs:p:e:S:" opt; do
+		case "${opt}" in
+			d)
+				if [[ $EUID -ne 0 ]]; then
+					ErrorFunc 'Give this script Sudo Permission to Delete files'
+					InfoFunc "Run: sudo $(basename "$0") -d"
+					exit 1
+				fi
+				clear
+				source /etc/eivom/eivomvars
+				FileDir="$(dirname "$(readlink -f "$0")")/$(basename "$0")"
+				rm "$FileDir"
+				rm -r /etc/eivom
+				for barmod in $(seq 1 100); do
+					sleep 0.001
+					ProgressBarModifiedUnin "${barmod}" 100
+				done
+				printf '\n'
+				InfoFunc "Uninstalling Completed!"
+				exit 0
+				;;
+			D)
+				DownloadMode="1"
+				;;
+			V)
+				VidPlayer="vlc"
+				# ENV Variable change
+				if [[ $VidPlayer == "vlc" ]]; then
+					if [[ -n "$(ls /mnt/c/'Program Files (x86)'/VideoLAN 2> /dev/null)" ]]; then
+						[[ ! "$PATH" =~ /VideoLAN/VLC ]]; export PATH="$PATH:/mnt/c/Program Files (x86)/VideoLAN/VLC"
+					elif [[ -n "$(ls /mnt/c/Program Files/VideoLAN 2> /dev/null)" ]]; then
+						[[ ! "$PATH" =~ /VideoLAN/VLC ]]; export PATH="$PATH:/mnt/c/Program Files/VideoLAN/VLC"
+					else
+						ErrorFunc 'Unable to Find VLC file Directory, Make Sure that VLC is installed in "C:/Program Files" or in "C:/Program Files (x86)" directory'
+						exit 1
+					fi
+				fi
+				;;
+			v)
+				echo "v0.1 beta (Terrible Source)"
+				exit 0
+				;;
+			h)
+				ErrorHelp
+				exit 0
+				;;
+			s)
+				SearchArgTemp="${OPTARG}"
+				case "${SearchArgTemp}" in
+					-*)
+						ErrorFunc "Search Query is Not Specified"
+						ErrorHelp
+						exit 1
+						;;
+					*)
+						MovieName="${SearchArgTemp}"
+						;;
+				esac
+				;;
+			p)
+				PickArgTemp="${OPTARG}"
+				case "${SearchArgTemp}" in
+					-*)
+						ErrorFunc "Picks is Not Specified"
+						ErrorHelp
+						exit 1
+						;;
+					*)
+						MoviePicked=${PickArgTemp}
+						;;
+				esac
+				;;
+			e)
+				EpisodeArgTemp="${OPTARG}"
+				case "${EpisodeArgTemp}" in
+					-*)
+						ErrorFunc "Episode is Not Specified"
+						ErrorHelp
+						exit 1
+						;;
+					[0-9]*|[M|m]ovie)
+						EpsCelc=${EpisodeArgTemp}
+						;;
+					*)
+						ErrorFunc "Invalid Value"
+						ErrorHelp
+						exit 1
+						;;
+				esac
+				;;
+			S)
+				ServerArgTemp="${OPTARG}"
+				case "${ServerArgTemp}" in
+					-*)
+						ErrorFunc "Episode is Not Specified"
+						ErrorHelp
+						exit 1
+						;;
+					[0-9]*)
+						server=${ServerArgTemp}
+						;;
+					*)
+						ErrorFunc "Invalid Value"
+						ErrorHelp
+						exit 1
+						;;
+				esac
+				;;
+			\?)
+				ErrorFunc "[ ${OPTARG}: is not valid Argument ]"
+				ErrorHelp
+				exit 1
+				;;
+			:)
+				ErrorFunc "[ ${OPTARG} Argument must have a Value ]"
+				ErrorHelp
+				exit 1
+				;;
+		esac
+	done
+}
+
+function ErrorHelp(){
+	echo -e 'Usage: eivom-cli [-dDvh]'
+	echo -e 'Usage: eivom-cli -s "[movie]" -e "Movie" -S "[1|2]"'
+	echo -e ""
+	echo -e "A Simple program that allows you to download/watch movies via command line."
+	echo -e ""
+	echo -e "Options:"
+	echo -e "   -S\t\t\t: Specify Server"
+	echo -e "   -e\t\t\t: Select Episode (Default: Movie)"
+	echo -e "   -p\t\t\t: Specify Picks"
+	echo -e "   -s\t\t\t: Search Movie"
+	echo -e "   -D\t\t\t: Download Mode"
+	echo -e "   -V\t\t\t: Use VLC as Video Player (For Windows)"
+	echo -e "   -d\t\t\t: Uninstall Script with its Config Files"
+	echo -e "   -v\t\t\t: Show the version of the script"
+	echo -e "   -h\t\t\t: Show this help"
+	echo
+}
+
+InstallPrerequisites
+if [[ $DownloadMode == "1" ]]; then
+	function MainFunctions(){
+		if [[ -x "$(command -v apt)" ]]; then
+			AutoInstallerDependenciesapt
+		fi
+		isDependenciesInstalled
+		InputsGet
+		ScraperStateion
+		DownloadMovieEngine
+	}
+else
+	function MainFunctions(){
+		if [[ -x "$(command -v apt)" ]]; then
+			AutoInstallerDependenciesapt
+		fi
+		isDependenciesInstalled
+		InputsGet
+		WatchAnime
+	}
+fi
+ParseArgs "$@"
+MainFunctions
