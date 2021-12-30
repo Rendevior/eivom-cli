@@ -7,7 +7,7 @@ exist:
 	if ! [ -d $(ALLF) ]; then mkdir -p $(ALLF); fi
 
 install: exist
-	cp emina-cli $(DESTDIR)$(PREFIX)/sbin/eivom-cli
+	cp eivom-cli $(DESTDIR)$(PREFIX)/sbin/eivom-cli
 	chmod 0777 $(DESTDIR)$(PREFIX)/sbin/eivom-cli
 	cp files/eivomvars $(DESTDIR)$(ALLF)/eivomvars
 	
